@@ -11,8 +11,8 @@ const transporter = nodemailer.createTransport({
 const sendVerificationEmail = async (email, kode, nama) => {
     try {
         if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-            console.log(`[SIMULASI EMAIL] EMAIL_USER/EMAIL_PASS belum diatur. OTP untuk ${email}: ${kode}`);
-            return { sent: false, simulated: true, kode };
+            console.error("[MAILER ERROR] EMAIL_USER atau EMAIL_PASS belum diatur di .env");
+            return { sent: false, error: "Konfigurasi email belum lengkap" };
         }
 
         const info = await transporter.sendMail({
@@ -60,7 +60,7 @@ const sendVerificationEmail = async (email, kode, nama) => {
                     </div>
 
                     <p>
-                        Kode ini berlaku selama <strong>15 menit</strong>.
+                        Kode ini berlaku selama <strong>5 menit</strong>.
                     </p>
 
                     <p style="color: #777;">
@@ -81,25 +81,20 @@ const sendVerificationEmail = async (email, kode, nama) => {
             `,
         });
 
-        console.log("EMAIL TERKIRIM:", {
-            messageId: info.messageId,
-            accepted: info.accepted,
-            rejected: info.rejected,
-        });
+        console.log(`[MAILER SUCCESS] Email verifikasi berhasil dikirim ke: ${email}`);
 
-        return { sent: true, messageId: info.messageId, kode };
+        return { sent: true, messageId: info.messageId };
     } catch (error) {
-        console.warn("[MAILER WARNING] Gagal mengirim email via SMTP:", error.message);
-        console.log(`[VERIFIKASI EMAIL KODE] ${email}: ${kode}`);
-        return { sent: false, error: error.message, kode };
+        console.error(`[MAILER ERROR] Gagal mengirim email verifikasi ke ${email}:`, error.message);
+        return { sent: false, error: error.message };
     }
 };
 
 const sendResetPasswordEmail = async (email, kode, nama) => {
     try {
         if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-            console.log(`[SIMULASI EMAIL] EMAIL_USER/EMAIL_PASS belum diatur. Kode reset untuk ${email}: ${kode}`);
-            return { sent: false, simulated: true, kode };
+            console.error("[MAILER ERROR] EMAIL_USER atau EMAIL_PASS belum diatur di .env");
+            return { sent: false, error: "Konfigurasi email belum lengkap" };
         }
 
         const info = await transporter.sendMail({
@@ -115,7 +110,7 @@ Kode reset password kamu adalah:
 
 ${kode}
 
-Kode ini berlaku selama 15 menit.
+Kode ini berlaku selama 5 menit.
 
 Jika kamu tidak meminta reset password, abaikan email ini.
             `,
@@ -165,7 +160,7 @@ Jika kamu tidak meminta reset password, abaikan email ini.
 
                     <p>
                         Kode ini berlaku selama
-                        <strong>15 menit</strong>.
+                        <strong>5 menit</strong>.
                     </p>
 
                     <p style="color:#777;">
@@ -189,17 +184,12 @@ Jika kamu tidak meminta reset password, abaikan email ini.
             `,
         });
 
-        console.log("RESET PASSWORD EMAIL:", {
-            messageId: info.messageId,
-            accepted: info.accepted,
-            rejected: info.rejected,
-        });
+        console.log(`[MAILER SUCCESS] Email reset password berhasil dikirim ke: ${email}`);
 
-        return { sent: true, messageId: info.messageId, kode };
+        return { sent: true, messageId: info.messageId };
     } catch (error) {
-        console.warn("[MAILER WARNING] Gagal mengirim reset password via SMTP:", error.message);
-        console.log(`[RESET PASSWORD KODE] ${email}: ${kode}`);
-        return { sent: false, error: error.message, kode };
+        console.error(`[MAILER ERROR] Gagal mengirim reset password ke ${email}:`, error.message);
+        return { sent: false, error: error.message };
     }
 };
 

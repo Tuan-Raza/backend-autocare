@@ -12,6 +12,7 @@ const kendaraanRoutes = require("./routes/kendaraan");
 const bookingRoutes = require("./routes/booking");
 const paymentRoutes = require("./routes/payment");
 const emailChangeRoutes = require("./routes/emailChange");
+const adminRoutes = require("./routes/admin");
 testConnection();
 const app = express();
 
@@ -48,6 +49,7 @@ app.use(
     "/api/email-change",
     emailChangeRoutes
 );
+app.use("/api/admin", adminRoutes);
 
 
 // =========================

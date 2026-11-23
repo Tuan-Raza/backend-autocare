@@ -1,6 +1,6 @@
 const bcrypt = require("bcryptjs");
 const { db } = require("../config/database");
-const { sendVerificationEmail } = require("../utils/mailer");
+const mailer = require("../utils/mailer");
 
 // =====================================================
 // REQUEST UBAH EMAIL
@@ -19,9 +19,7 @@ const requestEmailChange = async (req, res) => {
         const email = newEmail.trim().toLowerCase();
 
         // Validasi format email
-        const emailRegex =
-            /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (!emailRegex.test(email)) {
             return res.status(400).json({
                 success: false,
@@ -50,10 +48,7 @@ const requestEmailChange = async (req, res) => {
         const user = users[0];
 
         // Email baru sama dengan email lama
-        if (
-            email.toLowerCase() ===
-            user.email.toLowerCase()
-        ) {
+        if (email.toLowerCase() === user.email.toLowerCase()) {
             return res.status(400).json({
                 success: false,
                 message: "Email baru sama dengan email saat ini",
@@ -92,7 +87,39 @@ const requestEmailChange = async (req, res) => {
             });
         }
 
-        // Hapus OTP lama milik user
+        // Cek cooldown 60 detik jika sebelumnya sudah meminta OTP
+        const [existingChange] = await db.query(
+            `SELECT (UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(created_at)) AS elapsed_seconds
+             FROM email_changes
+             WHERE user_id = ?
+             ORDER BY id DESC
+             LIMIT 1`,
+            [userId]
+        );
+
+        if (
+            existingChange.length > 0 &&
+            existingChange[0].elapsed_seconds !== null &&
+            existingChange[0].elapsed_seconds < 60
+        ) {
+            const remaining = 60 - Math.floor(existingChange[0].elapsed_seconds);
+            return res.status(429).json({
+                success: false,
+                message: `Harap tunggu ${remaining} detik sebelum meminta kode OTP baru.`,
+                retryAfter: remaining,
+            });
+        }
+
+        // Generate OTP 6 digit
+        const kode = Math.floor(100000 + Math.random() * 900000).toString();
+
+        // Berlaku maksimal 5 menit
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+        // Hash OTP sebelum disimpan di database
+        const hashedKode = await bcrypt.hash(kode, 10);
+
+        // Hapus request OTP lama milik user
         await db.query(
             `
             DELETE FROM email_changes
@@ -101,17 +128,7 @@ const requestEmailChange = async (req, res) => {
             [userId]
         );
 
-        // Generate OTP 6 digit
-        const kode = Math.floor(
-            100000 + Math.random() * 900000
-        ).toString();
-
-        // Berlaku 10 menit
-        const expiresAt = new Date(
-            Date.now() + 10 * 60 * 1000
-        );
-
-        // Simpan request perubahan email
+        // Simpan request perubahan email dengan hashed kode dan attempts counter
         await db.query(
             `
             INSERT INTO email_changes
@@ -120,15 +137,16 @@ const requestEmailChange = async (req, res) => {
                 old_email,
                 new_email,
                 kode,
-                expires_at
+                expires_at,
+                attempts
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 0)
             `,
             [
                 user.id,
                 user.email,
                 email,
-                kode,
+                hashedKode,
                 expiresAt,
             ]
         );
@@ -136,39 +154,45 @@ const requestEmailChange = async (req, res) => {
         // Kirim OTP ke EMAIL BARU dengan handling aman
         let mailSent = false;
         try {
-            const mailRes = await sendVerificationEmail(
+            const mailRes = await mailer.sendVerificationEmail(
                 email,
                 kode,
                 user.nama
             );
             if (mailRes && mailRes.sent) mailSent = true;
         } catch (err) {
-            console.warn("Gagal mengirim email ubah email:", err.message);
+            console.error("Gagal mengirim email ubah email:", err.message);
         }
 
-        console.log(`[UBAH EMAIL OTP] New Email: ${email} | OTP: ${kode}`);
+        if (!mailSent) {
+            await db.query(
+                `DELETE FROM email_changes WHERE user_id = ?`,
+                [user.id]
+            );
+            return res.status(500).json({
+                success: false,
+                message: "Gagal mengirim kode verifikasi ke email baru. Silakan coba beberapa saat lagi.",
+            });
+        }
 
-        res.json({
+        // Log aman tanpa membocorkan kode OTP
+        console.log(`[UBAH EMAIL OTP] New Email: ${email}`);
+
+        // Response aman tanpa kode OTP
+        return res.json({
             success: true,
-            message: mailSent
-                ? "Kode OTP berhasil dikirim ke email baru"
-                : `Kode OTP verifikasi Anda: ${kode}`,
-            otp: kode,
+            message: "Kode OTP verifikasi berhasil dikirim ke email baru. Silakan periksa folder kotak masuk atau spam.",
         });
     } catch (error) {
-        console.error(
-            "Request Email Change Error:",
-            error
-        );
+        console.error("Request Email Change Error:", error.message);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: "Gagal mengirim kode OTP",
             error: error.message,
         });
     }
 };
-
 
 // =====================================================
 // VERIFIKASI OTP & UPDATE EMAIL
@@ -184,6 +208,8 @@ const verifyEmailChange = async (req, res) => {
             });
         }
 
+        const kodeClean = String(kode).trim();
+
         const [rows] = await db.query(
             `
             SELECT *
@@ -198,18 +224,23 @@ const verifyEmailChange = async (req, res) => {
         if (rows.length === 0) {
             return res.status(404).json({
                 success: false,
-                message:
-                    "Permintaan perubahan email tidak ditemukan",
+                message: "Permintaan perubahan email tidak ditemukan atau sudah diproses",
             });
         }
 
         const change = rows[0];
 
-        // Cek expired
-        if (
-            new Date(change.expires_at).getTime() <
-            Date.now()
-        ) {
+        // Cek batas percobaan
+        if (change.attempts >= 5) {
+            await db.query("DELETE FROM email_changes WHERE id = ?", [change.id]);
+            return res.status(400).json({
+                success: false,
+                message: "Batas percobaan verifikasi telah habis (maksimal 5 kali). Silakan minta kode baru.",
+            });
+        }
+
+        // Cek expired (maksimal 5 menit)
+        if (new Date(change.expires_at).getTime() < Date.now()) {
             await db.query(
                 `
                 DELETE FROM email_changes
@@ -220,16 +251,35 @@ const verifyEmailChange = async (req, res) => {
 
             return res.status(400).json({
                 success: false,
-                message:
-                    "Kode OTP sudah expired. Silakan minta kode baru.",
+                message: "Kode OTP sudah kedaluwarsa. Silakan minta kode baru.",
             });
         }
 
-        // Cek OTP
-        if (String(kode).trim() !== String(change.kode)) {
+        // Cek kecocokan OTP (support bcrypt hash atau plain text)
+        const isOtpValid = change.kode.startsWith("$2")
+            ? await bcrypt.compare(kodeClean, change.kode)
+            : String(change.kode) === kodeClean;
+
+        if (!isOtpValid) {
+            const nextAttempts = (change.attempts || 0) + 1;
+            await db.query(
+                "UPDATE email_changes SET attempts = attempts + 1 WHERE id = ?",
+                [change.id]
+            );
+
+            const remainingAttempts = Math.max(0, 5 - nextAttempts);
+
+            if (remainingAttempts === 0) {
+                await db.query("DELETE FROM email_changes WHERE id = ?", [change.id]);
+                return res.status(400).json({
+                    success: false,
+                    message: "Kode OTP salah. Batas percobaan habis. Silakan minta kode baru.",
+                });
+            }
+
             return res.status(400).json({
                 success: false,
-                message: "Kode OTP salah",
+                message: `Kode OTP salah. Sisa percobaan: ${remainingAttempts} kali.`,
             });
         }
 
@@ -256,8 +306,7 @@ const verifyEmailChange = async (req, res) => {
 
             return res.status(409).json({
                 success: false,
-                message:
-                    "Email tersebut sudah digunakan akun lain",
+                message: "Email tersebut sudah digunakan akun lain",
             });
         }
 
@@ -271,7 +320,7 @@ const verifyEmailChange = async (req, res) => {
             [change.new_email, userId]
         );
 
-        // Hapus OTP setelah berhasil
+        // Hapus OTP setelah berhasil agar tidak bisa digunakan kembali
         await db.query(
             `
             DELETE FROM email_changes
@@ -291,18 +340,15 @@ const verifyEmailChange = async (req, res) => {
             [userId]
         );
 
-        res.json({
+        return res.json({
             success: true,
             message: "Email berhasil diubah",
             data: updatedUsers[0],
         });
     } catch (error) {
-        console.error(
-            "Verify Email Change Error:",
-            error
-        );
+        console.error("Verify Email Change Error:", error.message);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: "Gagal memverifikasi email",
             error: error.message,

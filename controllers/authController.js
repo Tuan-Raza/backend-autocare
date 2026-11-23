@@ -1,21 +1,13 @@
-const {db} = require("../config/database");
+const { db } = require("../config/database");
 const bcrypt = require("bcryptjs");
-const {
-    sendVerificationEmail,
-    sendResetPasswordEmail,
-} = require("../utils/mailer");
+const mailer = require("../utils/mailer");
 
 // ===============================
 // REGISTER
 // ===============================
 const register = async (req, res) => {
     try {
-        const {
-            nama,
-            email,
-            noHp,
-            password,
-        } = req.body;
+        const { nama, email, noHp, password } = req.body;
 
         if (!nama || !email || !password) {
             return res.status(400).json({
@@ -54,14 +46,13 @@ const register = async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, 10);
 
         // Generate OTP 6 digit
-        const kode = Math.floor(
-            100000 + Math.random() * 900000
-        ).toString();
+        const kode = Math.floor(100000 + Math.random() * 900000).toString();
 
-        // OTP berlaku 15 menit
-        const expiresAt = new Date(
-            Date.now() + 15 * 60 * 1000
-        );
+        // OTP berlaku maksimal 5 menit
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+        // Hash OTP sebelum disimpan di database demi keamanan
+        const hashedKode = await bcrypt.hash(kode, 10);
 
         // Hapus OTP lama untuk email tersebut
         await db.query(
@@ -69,7 +60,7 @@ const register = async (req, res) => {
             [emailClean]
         );
 
-        // Simpan data sementara
+        // Simpan data sementara dengan hashed OTP dan attempts counter
         await db.query(
             `INSERT INTO email_verifications
             (
@@ -78,23 +69,24 @@ const register = async (req, res) => {
                 no_hp,
                 password,
                 kode,
-                expires_at
+                expires_at,
+                attempts
             )
-            VALUES (?, ?, ?, ?, ?, ?)`,
+            VALUES (?, ?, ?, ?, ?, ?, 0)`,
             [
                 namaClean,
                 emailClean,
                 noHpClean,
                 hashedPassword,
-                kode,
+                hashedKode,
                 expiresAt,
             ]
         );
 
-        // Kirim OTP ke email dengan handling aman
+        // Kirim OTP HANYA melalui email menggunakan Nodemailer
         let mailSent = false;
         try {
-            const mailRes = await sendVerificationEmail(
+            const mailRes = await mailer.sendVerificationEmail(
                 emailClean,
                 kode,
                 namaClean
@@ -103,22 +95,33 @@ const register = async (req, res) => {
                 mailSent = true;
             }
         } catch (mailErr) {
-            console.warn("Gagal mengirim email pendaftaran:", mailErr.message);
+            console.error("Gagal mengirim email pendaftaran:", mailErr.message);
         }
 
-        console.log(`[PENDAFTARAN SUKSES] Email: ${emailClean} | OTP: ${kode}`);
+        // Jika email gagal dikirim, hapus data verifikasi dan kirim response error aman
+        if (!mailSent) {
+            await db.query(
+                "DELETE FROM email_verifications WHERE LOWER(email) = ?",
+                [emailClean]
+            );
+            return res.status(500).json({
+                success: false,
+                message: "Gagal mengirim email verifikasi. Pastikan alamat email aktif atau coba beberapa saat lagi.",
+            });
+        }
 
-        res.status(201).json({
+        // Log aman tanpa membocorkan kode OTP
+        console.log(`[PENDAFTARAN SUKSES] Email: ${emailClean}`);
+
+        // Response aman tanpa kode OTP di JSON maupun pesan
+        return res.status(201).json({
             success: true,
-            message: mailSent
-                ? "Kode verifikasi telah dikirim ke email Anda"
-                : `Pendaftaran berhasil! Gunakan kode verifikasi: ${kode}`,
-            otp: kode, // Disertakan agar selalu bisa diverifikasi tanpa hambatan
+            message: "Kode verifikasi telah dikirim ke email Anda. Silakan periksa kotak masuk atau spam email Anda.",
         });
     } catch (error) {
-        console.error("Register Error:", error);
+        console.error("Register Error:", error.message);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: "Gagal melakukan registrasi",
             error: error.message,
@@ -131,10 +134,7 @@ const register = async (req, res) => {
 // ===============================
 const verifyEmail = async (req, res) => {
     try {
-        const {
-            email,
-            kode,
-        } = req.body;
+        const { email, kode } = req.body;
 
         if (!email || !kode) {
             return res.status(400).json({
@@ -165,19 +165,58 @@ const verifyEmail = async (req, res) => {
 
         const data = verification[0];
 
-        // Cek OTP
-        if (String(data.kode) !== kodeClean) {
+        // Cek batas percobaan verifikasi (maksimal 5 kali)
+        if (data.attempts >= 5) {
+            await db.query(
+                "DELETE FROM email_verifications WHERE id = ?",
+                [data.id]
+            );
             return res.status(400).json({
                 success: false,
-                message: "Kode verifikasi salah.",
+                message: "Batas percobaan verifikasi telah habis (maksimal 5 kali). Silakan minta kode verifikasi baru.",
             });
         }
 
-        // Cek expired
+        // Cek expired (maksimal 5 menit)
         if (new Date(data.expires_at).getTime() < Date.now()) {
+            await db.query(
+                "DELETE FROM email_verifications WHERE id = ?",
+                [data.id]
+            );
             return res.status(400).json({
                 success: false,
                 message: "Kode verifikasi sudah kedaluwarsa. Silakan minta kode baru.",
+            });
+        }
+
+        // Verifikasi kecocokan OTP (support bcrypt hash dan legacy plain text)
+        const isOtpValid = data.kode.startsWith("$2")
+            ? await bcrypt.compare(kodeClean, data.kode)
+            : String(data.kode) === kodeClean;
+
+        if (!isOtpValid) {
+            const nextAttempts = (data.attempts || 0) + 1;
+            await db.query(
+                "UPDATE email_verifications SET attempts = attempts + 1 WHERE id = ?",
+                [data.id]
+            );
+
+            const remainingAttempts = Math.max(0, 5 - nextAttempts);
+
+            if (remainingAttempts === 0) {
+                await db.query(
+                    "DELETE FROM email_verifications WHERE id = ?",
+                    [data.id]
+                );
+                return res.status(400).json({
+                    success: false,
+                    message: "Kode verifikasi salah. Batas percobaan habis. Silakan kirim ulang kode baru.",
+                });
+            }
+
+            return res.status(400).json({
+                success: false,
+                message: `Kode verifikasi salah. Sisa percobaan: ${remainingAttempts} kali.`,
             });
         }
 
@@ -221,13 +260,13 @@ const verifyEmail = async (req, res) => {
             ]
         );
 
-        // Hapus data OTP pendaftaran
+        // Hapus data OTP pendaftaran agar tidak dapat digunakan kembali (One-Time Use)
         await db.query(
             "DELETE FROM email_verifications WHERE LOWER(email) = ?",
             [emailClean]
         );
 
-        res.json({
+        return res.json({
             success: true,
             message: "Email berhasil diverifikasi! Pendaftaran Anda selesai.",
             user: {
@@ -238,9 +277,9 @@ const verifyEmail = async (req, res) => {
             },
         });
     } catch (error) {
-        console.error("Verify Email Error:", error);
+        console.error("Verify Email Error:", error.message);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: "Gagal melakukan verifikasi email",
             error: error.message,
@@ -263,8 +302,9 @@ const resendVerification = async (req, res) => {
 
         const emailClean = email.trim().toLowerCase();
 
+        // Ambil data verifikasi dan hitung selisih detik sejak permintaan terakhir
         const [rows] = await db.query(
-            "SELECT * FROM email_verifications WHERE LOWER(email) = ? ORDER BY id DESC LIMIT 1",
+            "SELECT *, (UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(created_at)) AS elapsed_seconds FROM email_verifications WHERE LOWER(email) = ? ORDER BY id DESC LIMIT 1",
             [emailClean]
         );
 
@@ -276,34 +316,58 @@ const resendVerification = async (req, res) => {
         }
 
         const data = rows[0];
-        const newKode = Math.floor(100000 + Math.random() * 900000).toString();
-        const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-        await db.query(
-            "UPDATE email_verifications SET kode = ?, expires_at = ? WHERE id = ?",
-            [newKode, expiresAt, data.id]
-        );
-
-        let mailSent = false;
-        try {
-            const mailRes = await sendVerificationEmail(emailClean, newKode, data.nama);
-            if (mailRes && mailRes.sent) mailSent = true;
-        } catch (err) {
-            console.warn("Gagal kirim ulang email verifikasi:", err.message);
+        // Terapkan cooldown 60 detik sebelum dapat mengirim ulang OTP
+        if (data.elapsed_seconds !== null && data.elapsed_seconds < 60) {
+            const remaining = 60 - Math.floor(data.elapsed_seconds);
+            return res.status(429).json({
+                success: false,
+                message: `Harap tunggu ${remaining} detik sebelum meminta kode verifikasi baru.`,
+                retryAfter: remaining,
+            });
         }
 
-        console.log(`[KIRIM ULANG OTP] Email: ${emailClean} | OTP: ${newKode}`);
+        const newKode = Math.floor(100000 + Math.random() * 900000).toString();
 
-        res.json({
+        // OTP baru berlaku 5 menit
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+        // Hash OTP baru sebelum disimpan
+        const hashedKode = await bcrypt.hash(newKode, 10);
+
+        // Update database: perbarui kode, masa berlaku, reset percobaan, dan perbarui created_at untuk cooldown
+        await db.query(
+            "UPDATE email_verifications SET kode = ?, expires_at = ?, attempts = 0, created_at = NOW() WHERE id = ?",
+            [hashedKode, expiresAt, data.id]
+        );
+
+        // Kirim OTP baru melalui email
+        let mailSent = false;
+        try {
+            const mailRes = await mailer.sendVerificationEmail(emailClean, newKode, data.nama);
+            if (mailRes && mailRes.sent) mailSent = true;
+        } catch (err) {
+            console.error("Gagal kirim ulang email verifikasi:", err.message);
+        }
+
+        if (!mailSent) {
+            return res.status(500).json({
+                success: false,
+                message: "Gagal mengirim ulang email verifikasi. Silakan coba beberapa saat lagi.",
+            });
+        }
+
+        // Log aman tanpa kode OTP
+        console.log(`[KIRIM ULANG OTP] Email: ${emailClean}`);
+
+        // Response aman tanpa kode OTP
+        return res.json({
             success: true,
-            message: mailSent
-                ? "Kode verifikasi baru telah dikirim ke email Anda"
-                : `Kode verifikasi baru Anda: ${newKode}`,
-            otp: newKode,
+            message: "Kode verifikasi baru telah dikirim ke email Anda. Silakan periksa folder kotak masuk atau spam.",
         });
     } catch (error) {
-        console.error("Resend Verification Error:", error);
-        res.status(500).json({
+        console.error("Resend Verification Error:", error.message);
+        return res.status(500).json({
             success: false,
             message: "Gagal mengirim ulang kode verifikasi",
             error: error.message,
@@ -316,10 +380,7 @@ const resendVerification = async (req, res) => {
 // ===============================
 const login = async (req, res) => {
     try {
-        const {
-            email,
-            password,
-        } = req.body;
+        const { email, password } = req.body;
 
         if (!email || !password) {
             return res.status(400).json({
@@ -334,7 +395,7 @@ const login = async (req, res) => {
             "SELECT * FROM users WHERE email = ?",
             [emailClean]
         );
-        console.log(users);
+
         if (users.length === 0) {
             return res.status(401).json({
                 success: false,
@@ -356,7 +417,7 @@ const login = async (req, res) => {
             });
         }
 
-        res.json({
+        return res.json({
             success: true,
             message: "Login berhasil",
             user: {
@@ -368,16 +429,18 @@ const login = async (req, res) => {
             },
         });
     } catch (error) {
-        console.error("Login Error:", error);
+        console.error("Login Error:", error.message);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: "Terjadi kesalahan server",
         });
     }
 };
 
+// ===============================
 // FORGOT PASSWORD
+// ===============================
 const forgotPassword = async (req, res) => {
     try {
         const { email } = req.body;
@@ -409,15 +472,33 @@ const forgotPassword = async (req, res) => {
 
         const user = users[0];
 
-        // Generate OTP 6 digit
-        const kode = Math.floor(
-            100000 + Math.random() * 900000
-        ).toString();
-
-        // Berlaku 10 menit
-        const expiresAt = new Date(
-            Date.now() + 10 * 60 * 1000
+        // Cek cooldown 60 detik jika sebelumnya sudah ada permintaan reset
+        const [existingReset] = await db.query(
+            `SELECT (UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(created_at)) AS elapsed_seconds
+             FROM password_resets
+             WHERE email = ?
+             ORDER BY id DESC
+             LIMIT 1`,
+            [emailClean]
         );
+
+        if (existingReset.length > 0 && existingReset[0].elapsed_seconds !== null && existingReset[0].elapsed_seconds < 60) {
+            const remaining = 60 - Math.floor(existingReset[0].elapsed_seconds);
+            return res.status(429).json({
+                success: false,
+                message: `Harap tunggu ${remaining} detik sebelum meminta kode OTP reset password baru.`,
+                retryAfter: remaining,
+            });
+        }
+
+        // Generate OTP 6 digit
+        const kode = Math.floor(100000 + Math.random() * 900000).toString();
+
+        // Berlaku maksimal 5 menit
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+        // Hash OTP sebelum disimpan
+        const hashedKode = await bcrypt.hash(kode, 10);
 
         // Hapus OTP lama
         await db.query(
@@ -425,18 +506,19 @@ const forgotPassword = async (req, res) => {
             [emailClean]
         );
 
-        // Simpan OTP baru
+        // Simpan OTP baru dengan hashed kode dan attempts counter
         await db.query(
             `INSERT INTO password_resets
             (
                 email,
                 kode,
-                expires_at
+                expires_at,
+                attempts
             )
-            VALUES (?, ?, ?)`,
+            VALUES (?, ?, ?, 0)`,
             [
                 emailClean,
-                kode,
+                hashedKode,
                 expiresAt,
             ]
         );
@@ -444,40 +526,49 @@ const forgotPassword = async (req, res) => {
         // Kirim OTP ke email
         let mailSent = false;
         try {
-            const mailRes = await sendResetPasswordEmail(
+            const mailRes = await mailer.sendResetPasswordEmail(
                 emailClean,
                 kode,
                 user.nama
             );
             if (mailRes && mailRes.sent) mailSent = true;
         } catch (emailError) {
-            console.warn("Reset Password Email Error:", emailError.message);
+            console.error("Reset Password Email Error:", emailError.message);
         }
 
-        console.log(`[RESET PASSWORD OTP] Email: ${emailClean} | OTP: ${kode}`);
+        if (!mailSent) {
+            await db.query(
+                "DELETE FROM password_resets WHERE email = ?",
+                [emailClean]
+            );
+            return res.status(500).json({
+                success: false,
+                message: "Gagal mengirim email reset password. Silakan coba beberapa saat lagi.",
+            });
+        }
 
-        res.json({
+        // Log aman tanpa kode OTP
+        console.log(`[RESET PASSWORD OTP] Email: ${emailClean}`);
+
+        // Response aman tanpa kode OTP
+        return res.json({
             success: true,
-            message: mailSent
-                ? "Kode reset password telah dikirim ke email"
-                : `Kode reset password Anda: ${kode}`,
-            otp: kode,
+            message: "Kode reset password telah dikirim ke email Anda. Silakan periksa folder kotak masuk atau spam.",
         });
 
     } catch (error) {
-        console.error(
-            "Forgot Password Error:",
-            error
-        );
+        console.error("Forgot Password Error:", error.message);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
-            message:
-                "Terjadi kesalahan saat memproses reset password",
+            message: "Terjadi kesalahan saat memproses reset password",
         });
     }
 };
 
+// ===============================
+// VERIFY RESET OTP
+// ===============================
 const verifyResetOTP = async (req, res) => {
     try {
         const { email, kode } = req.body;
@@ -507,17 +598,18 @@ const verifyResetOTP = async (req, res) => {
         if (rows.length === 0) {
             return res.status(400).json({
                 success: false,
-                message: "Kode OTP tidak ditemukan. Silakan kirim ulang OTP.",
+                message: "Kode OTP tidak ditemukan atau sudah kedaluwarsa. Silakan kirim ulang OTP.",
             });
         }
 
         const resetData = rows[0];
 
-        // Cek kode OTP
-        if (String(resetData.kode) !== kodeClean) {
+        // Cek batas percobaan
+        if (resetData.attempts >= 5) {
+            await db.query("DELETE FROM password_resets WHERE id = ?", [resetData.id]);
             return res.status(400).json({
                 success: false,
-                message: "Kode OTP salah.",
+                message: "Batas percobaan verifikasi telah habis (maksimal 5 kali). Silakan minta kode OTP baru.",
             });
         }
 
@@ -526,9 +618,38 @@ const verifyResetOTP = async (req, res) => {
         const expiresAt = new Date(resetData.expires_at);
 
         if (now > expiresAt) {
+            await db.query("DELETE FROM password_resets WHERE id = ?", [resetData.id]);
             return res.status(400).json({
                 success: false,
                 message: "Kode OTP sudah kedaluwarsa. Silakan kirim ulang OTP.",
+            });
+        }
+
+        // Cek kode OTP (support bcrypt hash atau legacy plain text)
+        const isOtpValid = resetData.kode.startsWith("$2")
+            ? await bcrypt.compare(kodeClean, resetData.kode)
+            : String(resetData.kode) === kodeClean;
+
+        if (!isOtpValid) {
+            const nextAttempts = (resetData.attempts || 0) + 1;
+            await db.query(
+                "UPDATE password_resets SET attempts = attempts + 1 WHERE id = ?",
+                [resetData.id]
+            );
+
+            const remainingAttempts = Math.max(0, 5 - nextAttempts);
+
+            if (remainingAttempts === 0) {
+                await db.query("DELETE FROM password_resets WHERE id = ?", [resetData.id]);
+                return res.status(400).json({
+                    success: false,
+                    message: "Kode OTP salah. Batas percobaan habis. Silakan kirim ulang OTP baru.",
+                });
+            }
+
+            return res.status(400).json({
+                success: false,
+                message: `Kode OTP salah. Sisa percobaan: ${remainingAttempts} kali.`,
             });
         }
 
@@ -537,7 +658,7 @@ const verifyResetOTP = async (req, res) => {
             message: "OTP berhasil diverifikasi.",
         });
     } catch (error) {
-        console.error("VERIFY RESET OTP ERROR:", error);
+        console.error("VERIFY RESET OTP ERROR:", error.message);
 
         return res.status(500).json({
             success: false,
@@ -546,6 +667,9 @@ const verifyResetOTP = async (req, res) => {
     }
 };
 
+// ===============================
+// RESET PASSWORD
+// ===============================
 const resetPassword = async (req, res) => {
     try {
         const {
@@ -557,8 +681,7 @@ const resetPassword = async (req, res) => {
         if (!email || !password || !confirmPassword) {
             return res.status(400).json({
                 success: false,
-                message:
-                    "Email, password, dan konfirmasi password wajib diisi.",
+                message: "Email, password, dan konfirmasi password wajib diisi.",
             });
         }
 
@@ -575,16 +698,14 @@ const resetPassword = async (req, res) => {
         if (!/\d/.test(password)) {
             return res.status(400).json({
                 success: false,
-                message:
-                    "Password harus mengandung minimal 1 angka.",
+                message: "Password harus mengandung minimal 1 angka.",
             });
         }
 
         if (password !== confirmPassword) {
             return res.status(400).json({
                 success: false,
-                message:
-                    "Konfirmasi password tidak cocok.",
+                message: "Konfirmasi password tidak cocok.",
             });
         }
 
@@ -602,8 +723,7 @@ const resetPassword = async (req, res) => {
         if (users.length === 0) {
             return res.status(404).json({
                 success: false,
-                message:
-                    "Akun dengan email tersebut tidak ditemukan.",
+                message: "Akun dengan email tersebut tidak ditemukan.",
             });
         }
 
@@ -618,8 +738,7 @@ const resetPassword = async (req, res) => {
         if (passwordSama) {
             return res.status(400).json({
                 success: false,
-                message:
-                    "Password baru tidak boleh sama dengan password sebelumnya.",
+                message: "Password baru tidak boleh sama dengan password sebelumnya.",
             });
         }
 
@@ -639,7 +758,7 @@ const resetPassword = async (req, res) => {
             [hashedPassword, user.id]
         );
 
-        // Hapus OTP yang sudah digunakan
+        // Hapus OTP yang sudah digunakan agar tidak dapat digunakan kembali
         await db.query(
             `
             DELETE FROM password_resets
@@ -650,24 +769,17 @@ const resetPassword = async (req, res) => {
 
         return res.status(200).json({
             success: true,
-            message:
-                "Password berhasil diubah. Silakan login kembali.",
+            message: "Password berhasil diubah. Silakan login kembali.",
         });
     } catch (error) {
-        console.error(
-            "RESET PASSWORD ERROR:",
-            error
-        );
+        console.error("RESET PASSWORD ERROR:", error.message);
 
         return res.status(500).json({
             success: false,
-            message:
-                "Terjadi kesalahan pada server.",
+            message: "Terjadi kesalahan pada server.",
         });
     }
 };
-
-
 
 module.exports = {
     register,
