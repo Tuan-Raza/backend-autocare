@@ -128,7 +128,12 @@ const getJadwal = async (req, res) => {
             });
         }
 
-        const [rows] = await db.query(
+        let cleanTanggal = String(tanggal).trim();
+        if (cleanTanggal.includes("T")) {
+            cleanTanggal = cleanTanggal.split("T")[0];
+        }
+
+        let [rows] = await db.query(
             `SELECT
                 id,
                 bengkel_id,
@@ -140,15 +145,50 @@ const getJadwal = async (req, res) => {
              FROM jadwal
              WHERE bengkel_id = ?
                AND tanggal = ?
-               AND status = 'tersedia'
-               AND tersedia > 0
              ORDER BY jam ASC`,
-            [bengkelId, tanggal]
+            [bengkelId, cleanTanggal]
+        );
+
+        // Jika belum ada jadwal di DB untuk tanggal & bengkel ini, buat slot otomatis
+        if (rows.length === 0) {
+            const defaultHours = [
+                "09:00:00",
+                "10:00:00",
+                "11:00:00",
+                "13:00:00",
+                "14:00:00",
+                "15:00:00",
+                "16:00:00",
+                "17:00:00",
+                "18:00:00",
+                "19:00:00",
+            ];
+
+            for (const jam of defaultHours) {
+                const [result] = await db.query(
+                    `INSERT INTO jadwal (bengkel_id, tanggal, jam, kapasitas, tersedia, status)
+                     VALUES (?, ?, ?, 2, 2, 'tersedia')`,
+                    [bengkelId, cleanTanggal, jam]
+                );
+                rows.push({
+                    id: result.insertId,
+                    bengkel_id: Number(bengkelId),
+                    tanggal: cleanTanggal,
+                    jam,
+                    kapasitas: 2,
+                    tersedia: 2,
+                    status: "tersedia",
+                });
+            }
+        }
+
+        const availableRows = rows.filter(
+            (r) => r.status === "tersedia" && Number(r.tersedia) > 0
         );
 
         res.json({
             success: true,
-            data: rows,
+            data: availableRows.length > 0 ? availableRows : rows,
         });
     } catch (error) {
         console.error("Get Jadwal Error:", error);
@@ -169,33 +209,43 @@ const createBooking = async (req, res) => {
     const connection = await db.getConnection();
 
     try {
-        const {
-            userId,
-            kendaraanId,
-            bengkelId,
-            jadwalId,
-            tanggalBooking,
-            jamBooking,
-            layanan,
-            keluhan,
-        } = req.body;
+        // Mendukung camelCase dan snake_case secara fleksibel
+        const userId = Number(
+            req.body.userId || req.body.user_id || req.user?.id
+        );
+        const kendaraanId = Number(
+            req.body.kendaraanId || req.body.kendaraan_id || req.body.vehicleId || req.body.vehicle_id
+        );
+        const bengkelId = Number(
+            req.body.bengkelId || req.body.bengkel_id || req.body.workshopId || req.body.workshop_id
+        );
+        let jadwalId =
+            req.body.jadwalId || req.body.jadwal_id || req.body.scheduleId || req.body.schedule_id;
+        jadwalId = jadwalId ? Number(jadwalId) : null;
+
+        const tanggalBooking =
+            req.body.tanggalBooking || req.body.tanggal_booking || req.body.tanggal || req.body.bookingDate || req.body.booking_date;
+        const jamBooking =
+            req.body.jamBooking || req.body.jam_booking || req.body.jam || req.body.bookingTime || req.body.booking_time;
+        const layanan = req.body.layanan || req.body.services;
+        const keluhan = req.body.keluhan || req.body.catatan || "";
 
         // -------------------------------------------------
-        // VALIDASI DATA DASAR
+        // VALIDASI DATA DASAR DENGAN PESAN SPESIFIK
         // -------------------------------------------------
-        if (
-            !userId ||
-            !kendaraanId ||
-            !bengkelId ||
-            !jadwalId ||
-            !tanggalBooking ||
-            !jamBooking ||
-            !Array.isArray(layanan) ||
-            layanan.length === 0
-        ) {
+        const missingFields = [];
+        if (!userId || isNaN(userId)) missingFields.push("User ID (userId/user_id)");
+        if (!kendaraanId || isNaN(kendaraanId)) missingFields.push("Kendaraan ID (kendaraanId/kendaraan_id)");
+        if (!bengkelId || isNaN(bengkelId)) missingFields.push("Bengkel ID (bengkelId/bengkel_id)");
+        if (!tanggalBooking) missingFields.push("Tanggal Booking (tanggalBooking/tanggal)");
+        if (!jamBooking) missingFields.push("Jam Booking (jamBooking/jam)");
+        if (!Array.isArray(layanan) || layanan.length === 0) missingFields.push("Daftar Layanan (layanan)");
+
+        if (missingFields.length > 0) {
             return res.status(400).json({
                 success: false,
-                message: "Data booking belum lengkap",
+                message: `Data booking belum lengkap: ${missingFields.join(", ")}`,
+                missingFields,
             });
         }
 
@@ -242,7 +292,7 @@ const createBooking = async (req, res) => {
 
             return res.status(404).json({
                 success: false,
-                message: "Kendaraan tidak ditemukan",
+                message: "Kendaraan tidak ditemukan atau bukan milik akun Anda",
             });
         }
 
@@ -280,69 +330,89 @@ const createBooking = async (req, res) => {
             }
         }
 
-        // -------------------------------------------------
-        // CEK JADWAL + LOCK ROW
-        // -------------------------------------------------
-        const [jadwal] = await connection.query(
-            `SELECT
-                id,
-                bengkel_id,
-                tanggal,
-                jam,
-                tersedia,
-                status
-             FROM jadwal
-             WHERE id = ?
-               AND bengkel_id = ?
-               AND status = 'tersedia'
-             FOR UPDATE`,
-            [
-                jadwalId,
-                bengkelId,
-            ]
-        );
+        let cleanJam = String(jamBooking).trim();
+        if (cleanJam.length === 5) {
+            cleanJam = `${cleanJam}:00`;
+        }
 
-        if (jadwal.length === 0) {
-            await connection.rollback();
+        // -------------------------------------------------
+        // CEK JADWAL + LOCK ROW (ROBUST RESOLUTION)
+        // -------------------------------------------------
+        let jadwalRows = [];
+        if (jadwalId && !isNaN(jadwalId) && jadwalId < 100000) {
+            [jadwalRows] = await connection.query(
+                `SELECT
+                    id,
+                    bengkel_id,
+                    tanggal,
+                    jam,
+                    tersedia,
+                    status
+                 FROM jadwal
+                 WHERE id = ?
+                   AND bengkel_id = ?
+                 FOR UPDATE`,
+                [jadwalId, bengkelId]
+            );
+        }
 
-            return res.status(404).json({
-                success: false,
-                message: "Jadwal tidak ditemukan atau sudah tidak tersedia",
-            });
+        // Jika tidak ditemukan berdasarkan jadwalId, cari berdasarkan bengkel, tanggal, dan jam
+        if (jadwalRows.length === 0) {
+            [jadwalRows] = await connection.query(
+                `SELECT
+                    id,
+                    bengkel_id,
+                    tanggal,
+                    jam,
+                    tersedia,
+                    status
+                 FROM jadwal
+                 WHERE bengkel_id = ?
+                   AND tanggal = ?
+                   AND jam LIKE ?
+                 FOR UPDATE`,
+                [bengkelId, cleanTanggal, `${cleanJam.substring(0, 5)}%`]
+            );
+        }
+
+        // Jika belum ada di DB, buat slot jadwal baru secara dinamis
+        if (jadwalRows.length === 0) {
+            const [insertJadwal] = await connection.query(
+                `INSERT INTO jadwal (bengkel_id, tanggal, jam, kapasitas, tersedia, status)
+                 VALUES (?, ?, ?, 2, 2, 'tersedia')`,
+                [bengkelId, cleanTanggal, cleanJam]
+            );
+            jadwalId = insertJadwal.insertId;
+            jadwalRows = [
+                {
+                    id: jadwalId,
+                    bengkel_id: bengkelId,
+                    tanggal: cleanTanggal,
+                    jam: cleanJam,
+                    tersedia: 2,
+                    status: "tersedia",
+                },
+            ];
+        } else {
+            jadwalId = jadwalRows[0].id;
         }
 
         // Format tanggal dari jadwal database
-        const finalTanggal = jadwal[0].tanggal
-            ? (jadwal[0].tanggal instanceof Date
-                ? jadwal[0].tanggal.toISOString().split("T")[0]
-                : String(jadwal[0].tanggal).split("T")[0])
+        const finalTanggal = jadwalRows[0].tanggal
+            ? jadwalRows[0].tanggal instanceof Date
+                ? jadwalRows[0].tanggal.toISOString().split("T")[0]
+                : String(jadwalRows[0].tanggal).split("T")[0]
             : cleanTanggal;
 
-        const finalJam = jadwal[0].jam || jamBooking;
+        const finalJam = jadwalRows[0].jam || cleanJam;
 
-        // -------------------------------------------------
-        // CEK JAM JADWAL
-        // -------------------------------------------------
-        const jamDatabase = String(jadwal[0].jam);
-
-        if (!jamDatabase.startsWith(String(jamBooking).substring(0, 5))) {
+        // Cek ketersediaan slot
+        if (Number(jadwalRows[0].tersedia) <= 0) {
             await connection.rollback();
 
             return res.status(400).json({
                 success: false,
-                message: "Jam booking tidak sesuai dengan jadwal",
-            });
-        }
-
-        // -------------------------------------------------
-        // CEK SLOT
-        // -------------------------------------------------
-        if (Number(jadwal[0].tersedia) <= 0) {
-            await connection.rollback();
-
-            return res.status(400).json({
-                success: false,
-                message: "Jadwal sudah penuh",
+                message: "Jadwal pada jam tersebut sudah penuh. Silakan pilih jam lain.",
             });
         }
 
