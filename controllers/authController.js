@@ -1,5 +1,7 @@
 const { db } = require("../config/database");
 const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { JWT_SECRET } = require("../middleware/authMiddleware");
 const mailer = require("../utils/mailer");
 
 // ===============================
@@ -376,7 +378,7 @@ const resendVerification = async (req, res) => {
 };
 
 // ===============================
-// LOGIN
+// LOGIN (UNIFIED USER & ADMIN)
 // ===============================
 const login = async (req, res) => {
     try {
@@ -392,7 +394,7 @@ const login = async (req, res) => {
         const emailClean = email.trim().toLowerCase();
 
         const [users] = await db.query(
-            "SELECT * FROM users WHERE email = ?",
+            "SELECT id, nama, email, no_hp, password, foto, role, status FROM users WHERE LOWER(email) = ? LIMIT 1",
             [emailClean]
         );
 
@@ -404,6 +406,14 @@ const login = async (req, res) => {
         }
 
         const user = users[0];
+
+        // Validasi status akun (aktif/nonaktif)
+        if (user.status === "nonaktif") {
+            return res.status(403).json({
+                success: false,
+                message: "Akun Anda telah dinonaktifkan. Silakan hubungi customer service.",
+            });
+        }
 
         const passwordMatch = await bcrypt.compare(
             password,
@@ -417,15 +427,32 @@ const login = async (req, res) => {
             });
         }
 
+        // Tentukan role dari database secara pasti (default 'user' jika null)
+        const verifiedRole = user.role === "admin" ? "admin" : "user";
+
+        // Generate JWT token yang memuat identitas dan role yang terverifikasi
+        const token = jwt.sign(
+            {
+                id: user.id,
+                email: user.email,
+                nama: user.nama,
+                role: verifiedRole,
+            },
+            JWT_SECRET,
+            { expiresIn: "7d" }
+        );
+
         return res.json({
             success: true,
             message: "Login berhasil",
+            token,
             user: {
                 id: user.id,
                 nama: user.nama,
                 email: user.email,
                 noHp: user.no_hp,
                 foto: user.foto,
+                role: verifiedRole,
             },
         });
     } catch (error) {

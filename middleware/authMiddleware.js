@@ -26,7 +26,7 @@ const verifyToken = async (req, res, next) => {
 
         const decoded = jwt.verify(token, JWT_SECRET);
         req.user = decoded;
-        next();
+        await next();
     } catch (err) {
         console.error("verifyToken error:", err.message);
         return res.status(401).json({
@@ -41,25 +41,37 @@ const verifyToken = async (req, res, next) => {
  */
 const requireAdmin = async (req, res, next) => {
     try {
-        if (!req.user || req.user.role !== "admin") {
-            // Also double check database in case role changed
-            if (req.user && req.user.id) {
-                const [rows] = await db.query(
-                    "SELECT id, role, status FROM users WHERE id = ?",
-                    [req.user.id]
-                );
-                if (rows.length > 0 && rows[0].role === "admin" && rows[0].status !== "nonaktif") {
-                    req.user.role = "admin";
-                    return next();
-                }
-            }
+        if (!req.user || !req.user.id) {
+            return res.status(401).json({
+                success: false,
+                message: "Akses ditolak. Token autentikasi tidak valid.",
+            });
+        }
 
+        // Selalu verifikasi langsung ke database untuk memastikan akun aktif dan berstatus admin
+        const [rows] = await db.query(
+            "SELECT id, nama, email, role, status FROM users WHERE id = ? LIMIT 1",
+            [req.user.id]
+        );
+
+        if (rows.length === 0 || rows[0].role !== "admin") {
             return res.status(403).json({
                 success: false,
                 message: "Akses terlarang. Hanya administrator yang dapat mengakses resource ini.",
             });
         }
-        next();
+
+        if (rows[0].status === "nonaktif") {
+            return res.status(403).json({
+                success: false,
+                message: "Akses ditolak. Akun administrator telah dinonaktifkan.",
+            });
+        }
+
+        req.user.role = "admin";
+        req.user.nama = rows[0].nama;
+        req.user.email = rows[0].email;
+        await next();
     } catch (err) {
         console.error("requireAdmin error:", err.message);
         return res.status(500).json({
