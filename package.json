@@ -24,7 +24,6 @@
     "cors": "^2.8.6",
     "dotenv": "^18.0.4",
     "express": "^5.2.1",
-    "midtrans-client": "^1.4.3",
     "mysql2": "^3.24.6",
     "nodemailer": "^10.0.13",
     "uuid": "^14.0.3"

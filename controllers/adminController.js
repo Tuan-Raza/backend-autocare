@@ -856,6 +856,9 @@ const getPayments = async (req, res) => {
                 p.status_verifikasi,
                 p.bukti_transfer,
                 p.catatan,
+                p.catatan_penolakan,
+                p.verified_by,
+                p.verified_at,
                 p.transaction_time,
                 p.settlement_time,
                 p.created_at,
@@ -863,23 +866,36 @@ const getPayments = async (req, res) => {
                 b.status AS status_booking,
                 u.nama AS nama_pelanggan,
                 u.email AS email_pelanggan,
-                u.no_hp AS no_hp_pelanggan
+                u.no_hp AS no_hp_pelanggan,
+                admin_u.nama AS verified_by_nama
             FROM payments p
             LEFT JOIN booking b ON p.booking_id = b.id
             LEFT JOIN users u ON b.user_id = u.id
+            LEFT JOIN users admin_u ON p.verified_by = admin_u.id
             WHERE 1=1
         `;
         const params = [];
 
         if (status && status !== "semua") {
-            query += ` AND (p.transaction_status = ? OR p.status_verifikasi = ?)`;
-            params.push(status, status);
+            const statusLower = status.toLowerCase();
+            if (statusLower === "menunggu_verifikasi") {
+                query += ` AND p.status_verifikasi = 'menunggu_verifikasi'`;
+            } else if (statusLower === "belum_dibayar") {
+                query += ` AND (p.status_verifikasi = 'belum_dibayar' OR p.status_verifikasi = 'menunggu_pembayaran')`;
+            } else if (statusLower === "terverifikasi" || statusLower === "lunas") {
+                query += ` AND (p.status_verifikasi IN ('terverifikasi', 'diterima') OR p.transaction_status = 'settlement')`;
+            } else if (statusLower === "ditolak") {
+                query += ` AND (p.status_verifikasi = 'ditolak' OR p.transaction_status IN ('deny', 'cancel'))`;
+            } else {
+                query += ` AND (p.transaction_status = ? OR p.status_verifikasi = ?)`;
+                params.push(status, status);
+            }
         }
 
         if (q && q.trim()) {
-            query += ` AND (p.order_id LIKE ? OR b.kode_booking LIKE ? OR u.nama LIKE ?)`;
+            query += ` AND (p.order_id LIKE ? OR b.kode_booking LIKE ? OR u.nama LIKE ? OR u.no_hp LIKE ? OR u.email LIKE ?)`;
             const search = `%${q.trim()}%`;
-            params.push(search, search, search);
+            params.push(search, search, search, search, search);
         }
 
         query += ` ORDER BY p.id DESC`;
@@ -925,21 +941,27 @@ const verifyPayment = async (req, res) => {
         }
 
         const payment = payments[0];
-        const newTxStatus = status_verifikasi === "terverifikasi" ? "settlement" : "deny";
+        const isApprove = status_verifikasi === "terverifikasi";
+        const newTxStatus = isApprove ? "settlement" : "deny";
+        const catatanPenolakan = isApprove ? null : (catatan || "Bukti pembayaran ditolak oleh admin");
+        const adminId = req.user?.id || null;
 
         await db.query(
             `UPDATE payments
              SET status_verifikasi = ?,
                  transaction_status = ?,
                  catatan = COALESCE(?, catatan),
-                 settlement_time = ${status_verifikasi === "terverifikasi" ? "NOW()" : "NULL"},
+                 catatan_penolakan = ?,
+                 verified_by = ?,
+                 verified_at = NOW(),
+                 settlement_time = ${isApprove ? "NOW()" : "NULL"},
                  updated_at = NOW()
              WHERE id = ?`,
-            [status_verifikasi, newTxStatus, catatan || null, id]
+            [status_verifikasi, newTxStatus, catatan || null, catatanPenolakan, adminId, id]
         );
 
         // Jika diverifikasi, konfirmasi booking secara otomatis jika statusnya 'menunggu'
-        if (status_verifikasi === "terverifikasi" && payment.booking_id) {
+        if (isApprove && payment.booking_id) {
             await db.query(
                 "UPDATE booking SET status = 'dikonfirmasi' WHERE id = ? AND status = 'menunggu'",
                 [payment.booking_id]
@@ -948,7 +970,7 @@ const verifyPayment = async (req, res) => {
 
         return res.json({
             success: true,
-            message: `Pembayaran berhasil ${status_verifikasi === "terverifikasi" ? "diverifikasi" : "ditolak"}`,
+            message: `Pembayaran berhasil ${isApprove ? "diverifikasi (Disetujui)" : "ditolak"}`,
         });
     } catch (err) {
         console.error("verifyPayment error:", err);

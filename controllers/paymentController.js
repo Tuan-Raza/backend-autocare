@@ -1,109 +1,6 @@
 const { db } = require("../config/database");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
-const midtransClient = require("midtrans-client");
-
-// =====================================================
-// MIDTRANS SNAP CONFIG
-// =====================================================
-const snap = new midtransClient.Snap({
-    isProduction: process.env.MIDTRANS_IS_PRODUCTION === "true",
-    serverKey: process.env.MIDTRANS_SERVER_KEY || "",
-    clientKey: process.env.MIDTRANS_CLIENT_KEY || "",
-});
-
-// Helper untuk sync status transaksi Midtrans langsung ke DB
-async function syncMidtransTransactionStatus(orderId, currentPaymentId, bookingId) {
-    if (!orderId || !process.env.MIDTRANS_SERVER_KEY) return null;
-    try {
-        const statusResponse = await snap.transaction.status(orderId);
-        if (!statusResponse || !statusResponse.transaction_status) return null;
-
-        const {
-            transaction_status,
-            fraud_status,
-            payment_type,
-            transaction_id,
-            transaction_time,
-            settlement_time,
-        } = statusResponse;
-
-        let newTransactionStatus = transaction_status;
-        let newStatusVerifikasi = "menunggu_verifikasi";
-        let shouldConfirmBooking = false;
-        let shouldCancelBooking = false;
-
-        if (transaction_status === "capture") {
-            if (fraud_status === "accept") {
-                newTransactionStatus = "settlement";
-                newStatusVerifikasi = "diterima";
-                shouldConfirmBooking = true;
-            } else if (fraud_status === "challenge") {
-                newTransactionStatus = "challenge";
-                newStatusVerifikasi = "menunggu_verifikasi";
-            }
-        } else if (transaction_status === "settlement") {
-            newTransactionStatus = "settlement";
-            newStatusVerifikasi = "diterima";
-            shouldConfirmBooking = true;
-        } else if (transaction_status === "pending") {
-            newTransactionStatus = "pending";
-            newStatusVerifikasi = "menunggu_verifikasi";
-        } else if (
-            transaction_status === "deny" ||
-            transaction_status === "cancel" ||
-            transaction_status === "expire"
-        ) {
-            newTransactionStatus = transaction_status;
-            newStatusVerifikasi = "ditolak";
-            shouldCancelBooking = true;
-        }
-
-        await db.query(
-            `UPDATE payments
-             SET transaction_status = ?,
-                 status_verifikasi = ?,
-                 payment_type = COALESCE(?, payment_type),
-                 transaction_id = COALESCE(?, transaction_id),
-                 transaction_time = COALESCE(?, transaction_time),
-                 settlement_time = COALESCE(?, settlement_time),
-                 updated_at = NOW()
-             WHERE id = ?`,
-            [
-                newTransactionStatus,
-                newStatusVerifikasi,
-                payment_type || null,
-                transaction_id || null,
-                transaction_time || null,
-                settlement_time || (newTransactionStatus === "settlement" ? new Date() : null),
-                currentPaymentId,
-            ]
-        );
-
-        if (shouldConfirmBooking && bookingId) {
-            await db.query(
-                "UPDATE booking SET status = 'dikonfirmasi', updated_at = NOW() WHERE id = ?",
-                [bookingId]
-            );
-        } else if (shouldCancelBooking && bookingId) {
-            await db.query(
-                "UPDATE booking SET status = 'dibatalkan', updated_at = NOW() WHERE id = ? AND status = 'menunggu'",
-                [bookingId]
-            );
-        }
-
-        return {
-            transaction_status: newTransactionStatus,
-            status_verifikasi: newStatusVerifikasi,
-            payment_type,
-            transaction_id,
-        };
-    } catch (err) {
-        // Jika 404 dari Midtrans (transaksi belum pernah dibuat di Midtrans), abaikan
-        return null;
-    }
-}
 
 // =====================================================
 // GET PAYMENT BY BOOKING ID
@@ -112,6 +9,7 @@ async function syncMidtransTransactionStatus(orderId, currentPaymentId, bookingI
 const getPaymentByBookingId = async (req, res) => {
     try {
         const { bookingId } = req.params;
+        const requestedUserId = req.query.userId || req.user?.id;
 
         if (!bookingId) {
             return res.status(400).json({
@@ -151,6 +49,16 @@ const getPaymentByBookingId = async (req, res) => {
 
         const booking = bookingRows[0];
 
+        // Validasi kepemilikan booking jika userId disertakan (dan bukan admin)
+        if (requestedUserId && req.user?.role !== "admin") {
+            if (Number(booking.user_id) !== Number(requestedUserId)) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Akses ditolak: Anda tidak memiliki akses ke data booking ini",
+                });
+            }
+        }
+
         // Ambil item layanan
         const [detailRows] = await db.query(
             `SELECT
@@ -163,7 +71,7 @@ const getPaymentByBookingId = async (req, res) => {
         );
 
         // Ambil payment terbaru
-        let [paymentRows] = await db.query(
+        const [paymentRows] = await db.query(
             `SELECT *
              FROM payments
              WHERE booking_id = ?
@@ -171,28 +79,6 @@ const getPaymentByBookingId = async (req, res) => {
              LIMIT 1`,
             [bookingId]
         );
-
-        // Jika ada pembayaran pending via Midtrans, sinkronkan status terbaru dengan Midtrans
-        if (
-            paymentRows.length > 0 &&
-            paymentRows[0].transaction_status === "pending" &&
-            paymentRows[0].order_id
-        ) {
-            await syncMidtransTransactionStatus(
-                paymentRows[0].order_id,
-                paymentRows[0].id,
-                bookingId
-            );
-
-            // Muat ulang setelah sinkronisasi
-            const [refreshedRows] = await db.query(
-                `SELECT * FROM payments WHERE id = ? LIMIT 1`,
-                [paymentRows[0].id]
-            );
-            if (refreshedRows.length > 0) {
-                paymentRows = refreshedRows;
-            }
-        }
 
         return res.json({
             success: true,
@@ -215,7 +101,7 @@ const getPaymentByBookingId = async (req, res) => {
 };
 
 // =====================================================
-// SUBMIT MANUAL PAYMENT (QRIS, DANA, SeaBank, Bayar di Tempat)
+// SUBMIT PAYMENT (QRIS / COD)
 // POST /api/payment/manual
 // =====================================================
 const submitManualPayment = async (req, res) => {
@@ -252,96 +138,189 @@ const submitManualPayment = async (req, res) => {
 
         const booking = bookingRows[0];
         const grossAmount = Number(booking.total_harga) || 0;
-        const orderId = `AC-PAY-${booking.id}-${Date.now()}`;
 
-        let savedBuktiUrl = null;
+        if (!grossAmount || grossAmount <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Total tagihan booking tidak valid atau bernilai 0",
+            });
+        }
 
-        // Simpan gambar bukti transfer jika dikirim dalam Base64
-        if (buktiTransfer && typeof buktiTransfer === "string") {
-            if (buktiTransfer.startsWith("data:image/")) {
-                const uploadDir = path.join(__dirname, "../uploads/payments");
-                if (!fs.existsSync(uploadDir)) {
-                    fs.mkdirSync(uploadDir, { recursive: true });
-                }
+        const metodeClean = String(metodePembayaran).toLowerCase().trim();
+        const isCod = metodeClean === "cod" || metodeClean === "bayar_di_tempat";
 
-                const matches = buktiTransfer.match(/^data:image\/([a-zA-Z0-9.+]+);base64,(.+)$/);
-                let ext = "jpg";
-                let base64Data = buktiTransfer;
+        // Cek apakah sudah pernah ada record payment untuk booking ini
+        const [existingPayments] = await db.query(
+            "SELECT id, order_id, status_verifikasi, transaction_status FROM payments WHERE booking_id = ? ORDER BY id DESC LIMIT 1",
+            [bookingId]
+        );
 
-                if (matches && matches.length === 3) {
-                    ext = matches[1] === "jpeg" ? "jpg" : matches[1];
-                    base64Data = matches[2];
-                } else {
-                    base64Data = buktiTransfer.replace(/^data:image\/\w+;base64,/, "");
-                }
-
-                const filename = `bukti-${bookingId}-${Date.now()}.${ext}`;
-                const filePath = path.join(uploadDir, filename);
-
-                fs.writeFileSync(filePath, Buffer.from(base64Data, "base64"));
-                savedBuktiUrl = `/uploads/payments/${filename}`;
-            } else {
-                savedBuktiUrl = buktiTransfer;
+        // Pencegahan pembayaran ganda: jika sudah lunas/terverifikasi, tolak request pembayaran baru
+        if (existingPayments.length > 0) {
+            const prev = existingPayments[0];
+            if (
+                prev.status_verifikasi === "terverifikasi" ||
+                prev.status_verifikasi === "diterima" ||
+                prev.transaction_status === "settlement"
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Pembayaran untuk booking ini sudah diverifikasi dan berstatus LUNAS",
+                });
             }
         }
 
-        // Tentukan status verifikasi
+        let savedBuktiUrl = null;
+
+        // Validasi bukti transfer untuk QRIS
+        if (!isCod) {
+            if (!buktiTransfer) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Foto bukti pembayaran wajib diunggah untuk metode QRIS",
+                });
+            }
+
+            // Validasi ukuran string Base64 (maksimal ~10MB)
+            if (typeof buktiTransfer === "string") {
+                if (buktiTransfer.length > 14 * 1024 * 1024) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Ukuran file bukti pembayaran terlalu besar (maksimal 10MB)",
+                    });
+                }
+
+                if (buktiTransfer.startsWith("data:image/")) {
+                    const matches = buktiTransfer.match(/^data:image\/([a-zA-Z0-9.+]+);base64,(.+)$/);
+                    if (!matches || matches.length !== 3) {
+                        return res.status(400).json({
+                            success: false,
+                            message: "Format gambar bukti transfer tidak valid",
+                        });
+                    }
+
+                    let ext = matches[1].toLowerCase();
+                    if (ext === "jpeg") ext = "jpg";
+                    const allowedExts = ["jpg", "png", "webp", "heic"];
+                    if (!allowedExts.includes(ext)) {
+                        return res.status(400).json({
+                            success: false,
+                            message: "Tipe file tidak didukung. Harap gunakan format JPG, PNG, atau WEBP",
+                        });
+                    }
+
+                    const uploadDir = path.join(__dirname, "../uploads/payments");
+                    if (!fs.existsSync(uploadDir)) {
+                        fs.mkdirSync(uploadDir, { recursive: true });
+                    }
+
+                    const filename = `bukti-${metodeClean}-${bookingId}-${Date.now()}.${ext}`;
+                    const filePath = path.join(uploadDir, filename);
+
+                    fs.writeFileSync(filePath, Buffer.from(matches[2], "base64"));
+                    savedBuktiUrl = `/uploads/payments/${filename}`;
+                } else {
+                    savedBuktiUrl = buktiTransfer;
+                }
+            }
+        }
+
+        // Tentukan status verifikasi & transaksi
+        // QRIS: status_verifikasi = 'menunggu_verifikasi' (PENDING_VERIFICATION), transaction_status = 'pending'
+        // COD:  status_verifikasi = 'belum_dibayar' (UNPAID), transaction_status = 'pending'
         let statusVerifikasi = "menunggu_verifikasi";
         let transactionStatus = "pending";
 
-        if (metodePembayaran.toLowerCase() === "cod" || metodePembayaran.toLowerCase() === "bayar_di_tempat") {
-            statusVerifikasi = "diterima";
+        if (isCod) {
+            statusVerifikasi = "belum_dibayar";
             transactionStatus = "pending";
-            // Update status booking langsung menjadi dikonfirmasi
-            await db.query("UPDATE booking SET status = 'dikonfirmasi' WHERE id = ?", [bookingId]);
         }
 
-        // Simpan record pembayaran
-        const [insertResult] = await db.query(
-            `INSERT INTO payments
-            (
-                booking_id,
-                order_id,
-                gross_amount,
-                transaction_status,
-                payment_type,
-                metode_pembayaran,
-                bukti_transfer,
-                status_verifikasi,
-                catatan
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-                bookingId,
-                orderId,
-                grossAmount,
-                transactionStatus,
-                metodePembayaran,
-                metodePembayaran,
-                savedBuktiUrl,
-                statusVerifikasi,
-                catatan || null,
-            ]
-        );
+        let paymentId;
+        let orderId;
+
+        if (existingPayments.length > 0) {
+            paymentId = existingPayments[0].id;
+            orderId = existingPayments[0].order_id || `AC-PAY-${booking.id}-${Date.now()}`;
+
+            await db.query(
+                `UPDATE payments
+                 SET order_id = ?,
+                     gross_amount = ?,
+                     transaction_status = ?,
+                     payment_type = ?,
+                     metode_pembayaran = ?,
+                     bukti_transfer = COALESCE(?, bukti_transfer),
+                     status_verifikasi = ?,
+                     catatan = ?,
+                     catatan_penolakan = NULL,
+                     updated_at = NOW()
+                 WHERE id = ?`,
+                [
+                    orderId,
+                    grossAmount,
+                    transactionStatus,
+                    metodeClean,
+                    metodeClean,
+                    savedBuktiUrl,
+                    statusVerifikasi,
+                    catatan || null,
+                    paymentId,
+                ]
+            );
+        } else {
+            orderId = `AC-PAY-${booking.id}-${Date.now()}`;
+
+            const [insertResult] = await db.query(
+                `INSERT INTO payments
+                (
+                    booking_id,
+                    order_id,
+                    gross_amount,
+                    transaction_status,
+                    payment_type,
+                    metode_pembayaran,
+                    bukti_transfer,
+                    status_verifikasi,
+                    catatan
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    bookingId,
+                    orderId,
+                    grossAmount,
+                    transactionStatus,
+                    metodeClean,
+                    metodeClean,
+                    savedBuktiUrl,
+                    statusVerifikasi,
+                    catatan || null,
+                ]
+            );
+
+            paymentId = insertResult.insertId;
+        }
+
+        const message = isCod
+            ? "Metode Bayar di Tempat (COD) berhasil dipilih! Silakan lakukan pembayaran tunai di bengkel saat servis kendaraan."
+            : "Bukti transfer QRIS berhasil dikirim! Menunggu verifikasi admin.";
 
         return res.status(201).json({
             success: true,
-            message: (metodePembayaran.toLowerCase() === "cod" || metodePembayaran.toLowerCase() === "bayar_di_tempat")
-                ? "Metode pembayaran Bayar di Tempat berhasil dipilih! Booking Anda telah dikonfirmasi."
-                : "Bukti transfer berhasil dikirim! Menunggu verifikasi admin.",
+            message,
             data: {
-                paymentId: insertResult.insertId,
+                paymentId,
                 orderId,
                 bookingId,
                 grossAmount,
-                metodePembayaran,
+                metodePembayaran: metodeClean,
                 statusVerifikasi,
                 transactionStatus,
                 buktiTransfer: savedBuktiUrl,
             },
         });
     } catch (error) {
-        console.error("Submit Manual Payment Error:", error);
+        console.error("Submit Payment Error:", error);
         return res.status(500).json({
             success: false,
             message: "Gagal memproses pembayaran",
@@ -357,7 +336,7 @@ const submitManualPayment = async (req, res) => {
 const verifyManualPayment = async (req, res) => {
     try {
         const orderId = req.params.orderId || req.body.orderId;
-        const { status, alasan } = req.body; // status: 'diterima' | 'ditolak'
+        const { status, alasan } = req.body; // status: 'diterima' | 'terverifikasi' | 'ditolak' | 'lunas'
 
         if (!orderId) {
             return res.status(400).json({
@@ -366,10 +345,14 @@ const verifyManualPayment = async (req, res) => {
             });
         }
 
-        if (!status || !["diterima", "ditolak"].includes(status.toLowerCase())) {
+        const statusRaw = String(status || "").toLowerCase().trim();
+        const isApprove = ["diterima", "terverifikasi", "lunas"].includes(statusRaw);
+        const isReject = ["ditolak", "deny", "tolak"].includes(statusRaw);
+
+        if (!isApprove && !isReject) {
             return res.status(400).json({
                 success: false,
-                message: "Status verifikasi harus 'diterima' atau 'ditolak'",
+                message: "Status verifikasi harus 'terverifikasi' (diterima) atau 'ditolak'",
             });
         }
 
@@ -386,13 +369,16 @@ const verifyManualPayment = async (req, res) => {
         }
 
         const payment = paymentRows[0];
-        const statusClean = status.toLowerCase();
-        const newTransactionStatus = statusClean === "diterima" ? "settlement" : "cancel";
-        const settlementTime = statusClean === "diterima" ? new Date() : null;
+        const newStatusVerifikasi = isApprove ? "terverifikasi" : "ditolak";
+        const newTransactionStatus = isApprove ? "settlement" : "deny";
+        const settlementTime = isApprove ? new Date() : null;
+        const verifiedBy = req.user?.id || null;
 
         const updatedCatatan = alasan
             ? (payment.catatan ? `${payment.catatan} | Catatan Admin: ${alasan}` : `Catatan Admin: ${alasan}`)
             : payment.catatan;
+
+        const catatanPenolakan = isReject ? (alasan || "Bukti pembayaran tidak sesuai atau belum masuk") : null;
 
         await db.query(
             `UPDATE payments
@@ -400,37 +386,42 @@ const verifyManualPayment = async (req, res) => {
                 status_verifikasi = ?,
                 transaction_status = ?,
                 settlement_time = ?,
-                catatan = ?
+                catatan = ?,
+                catatan_penolakan = ?,
+                verified_by = ?,
+                verified_at = NOW(),
+                updated_at = NOW()
              WHERE id = ?`,
             [
-                statusClean,
+                newStatusVerifikasi,
                 newTransactionStatus,
                 settlementTime,
                 updatedCatatan,
+                catatanPenolakan,
+                verifiedBy,
                 payment.id,
             ]
         );
 
-        // Jika diterima (ACC), ubah status booking menjadi 'dikonfirmasi'
-        if (statusClean === "diterima") {
+        // Jika diverifikasi / lunas, konfirmasi booking secara otomatis jika statusnya 'menunggu'
+        if (isApprove && payment.booking_id) {
             await db.query(
-                "UPDATE booking SET status = 'dikonfirmasi' WHERE id = ?",
+                "UPDATE booking SET status = 'dikonfirmasi', updated_at = NOW() WHERE id = ? AND status = 'menunggu'",
                 [payment.booking_id]
             );
-        } else if (statusClean === "ditolak") {
-            // Biarkan booking 'menunggu' agar pengguna bisa upload bukti ulang
         }
 
         return res.json({
             success: true,
-            message: statusClean === "diterima"
-                ? "Pembayaran berhasil di-ACC (Diterima)!"
-                : "Pembayaran telah Ditolak.",
+            message: isApprove
+                ? "Pembayaran berhasil diverifikasi dan disetujui (Lunas)!"
+                : "Pembayaran telah ditolak.",
             data: {
                 orderId,
-                statusVerifikasi: statusClean,
+                statusVerifikasi: newStatusVerifikasi,
                 transactionStatus: newTransactionStatus,
                 settlementTime,
+                catatanPenolakan,
             },
         });
     } catch (error) {
@@ -438,183 +429,6 @@ const verifyManualPayment = async (req, res) => {
         return res.status(500).json({
             success: false,
             message: "Gagal memverifikasi pembayaran",
-            error: error.message,
-        });
-    }
-};
-
-// =====================================================
-// CREATE MIDTRANS PAYMENT (SNAP TRANSACTION)
-// POST /api/payment/create
-// =====================================================
-const createPayment = async (req, res) => {
-    try {
-        const bookingId = Number(req.body.bookingId || req.body.booking_id);
-        const userId = Number(req.body.userId || req.body.user_id || req.user?.id);
-
-        if (!bookingId || !userId) {
-            return res.status(400).json({
-                success: false,
-                message: "Booking ID dan User ID wajib disertakan",
-            });
-        }
-
-        // Ambil data booking dan user
-        const [bookingRows] = await db.query(
-            `SELECT
-                b.id,
-                b.kode_booking,
-                b.user_id,
-                b.total_harga,
-                b.status,
-                u.nama,
-                u.email,
-                u.no_hp
-             FROM booking b
-             INNER JOIN users u ON b.user_id = u.id
-             WHERE b.id = ? AND b.user_id = ?
-             LIMIT 1`,
-            [bookingId, userId]
-        );
-
-        if (bookingRows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "Booking tidak ditemukan atau bukan milik akun Anda",
-            });
-        }
-
-        const booking = bookingRows[0];
-        const grossAmount = Math.round(Number(booking.total_harga));
-
-        if (!grossAmount || grossAmount <= 0) {
-            return res.status(400).json({
-                success: false,
-                message: "Total pembayaran tidak valid atau bernilai 0",
-            });
-        }
-
-        // Ambil rincian layanan untuk item_details
-        const [detailRows] = await db.query(
-            `SELECT
-                bd.layanan_id,
-                bd.harga,
-                bd.qty,
-                bd.subtotal,
-                l.nama_layanan
-             FROM booking_detail bd
-             LEFT JOIN layanan l ON bd.layanan_id = l.id
-             WHERE bd.booking_id = ?`,
-            [bookingId]
-        );
-
-        // Susun item_details
-        let itemDetails = [];
-        if (detailRows.length > 0) {
-            itemDetails = detailRows.map((item) => ({
-                id: `SRV-${item.layanan_id}`,
-                price: Math.round(Number(item.harga)),
-                quantity: Number(item.qty || 1),
-                name: String(item.nama_layanan || "Layanan Servis").substring(0, 50),
-            }));
-        } else {
-            itemDetails = [
-                {
-                    id: `BOOK-${booking.id}`,
-                    price: grossAmount,
-                    quantity: 1,
-                    name: `Servis AutoCare #${booking.kode_booking}`.substring(0, 50),
-                },
-            ];
-        }
-
-        // Pastikan total item_details sama persis dengan grossAmount
-        const itemsTotal = itemDetails.reduce(
-            (sum, item) => sum + item.price * item.quantity,
-            0
-        );
-
-        if (itemsTotal !== grossAmount) {
-            const diff = grossAmount - itemsTotal;
-            itemDetails.push({
-                id: "ADJ-FEE",
-                price: diff,
-                quantity: 1,
-                name: diff > 0 ? "Biaya Penyesuaian" : "Potongan Diskon",
-            });
-        }
-
-        // Buat Order ID yang unik untuk transaksi ini
-        const orderId = `AC-PAY-${booking.id}-${Date.now()}`;
-
-        // Parse nama depan dan belakang
-        const nameParts = (booking.nama || "Pelanggan AutoCare").trim().split(" ");
-        const firstName = nameParts[0] || "Pelanggan";
-        const lastName = nameParts.slice(1).join(" ") || "AutoCare";
-
-        const parameter = {
-            transaction_details: {
-                order_id: orderId,
-                gross_amount: grossAmount,
-            },
-            customer_details: {
-                first_name: firstName,
-                last_name: lastName,
-                email: booking.email || "customer@autocare.com",
-                phone: booking.no_hp || "08123456789",
-            },
-            item_details: itemDetails,
-        };
-
-        // Buat transaksi Snap di Midtrans
-        const transaction = await snap.createTransaction(parameter);
-
-        if (!transaction || !transaction.token) {
-            throw new Error("Gagal mendapatkan Snap Token dari Midtrans");
-        }
-
-        // Simpan / update data pembayaran di database
-        await db.query(
-            `INSERT INTO payments
-            (
-                booking_id,
-                order_id,
-                snap_token,
-                gross_amount,
-                transaction_status,
-                payment_type,
-                metode_pembayaran,
-                status_verifikasi,
-                catatan
-            )
-            VALUES (?, ?, ?, ?, 'pending', 'midtrans', 'midtrans', 'menunggu_verifikasi', ?)`,
-            [
-                booking.id,
-                orderId,
-                transaction.token,
-                grossAmount,
-                `Midtrans Snap Token: ${transaction.token}`,
-            ]
-        );
-
-        return res.status(201).json({
-            success: true,
-            message: "Transaksi Midtrans berhasil disiapkan",
-            data: {
-                bookingId: booking.id,
-                kodeBooking: booking.kode_booking,
-                orderId,
-                grossAmount,
-                snapToken: transaction.token,
-                redirectUrl: transaction.redirect_url,
-                status: "pending",
-            },
-        });
-    } catch (error) {
-        console.error("Create Midtrans Payment Error:", error);
-        return res.status(500).json({
-            success: false,
-            message: error.message || "Gagal membuat transaksi Midtrans",
             error: error.message,
         });
     }
@@ -635,7 +449,7 @@ const getPaymentStatus = async (req, res) => {
             });
         }
 
-        let [rows] = await db.query(
+        const [rows] = await db.query(
             `SELECT
                 p.*,
                 b.kode_booking,
@@ -654,32 +468,6 @@ const getPaymentStatus = async (req, res) => {
             });
         }
 
-        // Jika status transaksi masih pending, sinkronkan langsung dengan Midtrans
-        if (rows[0].transaction_status === "pending") {
-            await syncMidtransTransactionStatus(
-                orderId,
-                rows[0].id,
-                rows[0].booking_id
-            );
-
-            // Muat ulang data terbaru setelah sinkronisasi
-            const [refreshedRows] = await db.query(
-                `SELECT
-                    p.*,
-                    b.kode_booking,
-                    b.status AS booking_status
-                 FROM payments p
-                 INNER JOIN booking b ON p.booking_id = b.id
-                 WHERE p.order_id = ?
-                 LIMIT 1`,
-                [orderId]
-            );
-
-            if (refreshedRows.length > 0) {
-                rows = refreshedRows;
-            }
-        }
-
         return res.json({
             success: true,
             data: rows[0],
@@ -694,161 +482,26 @@ const getPaymentStatus = async (req, res) => {
     }
 };
 
-// =====================================================
-// MIDTRANS NOTIFICATION (WEBHOOK)
-// POST /api/payment/notification
-// =====================================================
+// Backward-compatibility stubs for deprecated Midtrans endpoints
+const createPayment = async (req, res) => {
+    return res.status(400).json({
+        success: false,
+        message: "Metode pembayaran Midtrans telah digantikan oleh QRIS dan COD. Silakan gunakan endpoint /api/payment/manual.",
+    });
+};
+
 const paymentNotification = async (req, res) => {
-    try {
-        const notification = req.body;
-        console.log("MIDTRANS NOTIFICATION RECEIVED:", JSON.stringify(notification));
-
-        const {
-            order_id,
-            status_code,
-            gross_amount,
-            signature_key,
-            transaction_status,
-            fraud_status,
-            payment_type,
-            transaction_id,
-            transaction_time,
-            settlement_time,
-        } = notification;
-
-        if (!order_id || !status_code || !gross_amount || !signature_key) {
-            return res.status(400).json({
-                success: false,
-                message: "Format notifikasi tidak lengkap",
-            });
-        }
-
-        // Verifikasi Signature Key resmi Midtrans: SHA512(order_id + status_code + gross_amount + ServerKey)
-        const serverKey = process.env.MIDTRANS_SERVER_KEY || "";
-        const rawString = `${order_id}${status_code}${gross_amount}${serverKey}`;
-        const expectedSignature = crypto
-            .createHash("sha512")
-            .update(rawString)
-            .digest("hex");
-
-        if (signature_key !== expectedSignature) {
-            console.error("MIDTRANS SIGNATURE MISMATCH!");
-            return res.status(403).json({
-                success: false,
-                message: "Signature key tidak valid",
-            });
-        }
-
-        // Cari record pembayaran di database
-        const [payments] = await db.query(
-            `SELECT * FROM payments WHERE order_id = ? LIMIT 1`,
-            [order_id]
-        );
-
-        if (payments.length === 0) {
-            console.warn("Payment order_id not found in DB:", order_id);
-            return res.status(404).json({
-                success: false,
-                message: "Order ID tidak ditemukan di sistem AutoCare",
-            });
-        }
-
-        const payment = payments[0];
-
-        // Tentukan status pembayaran baru berdasarkan spesifikasi Midtrans
-        let newTransactionStatus = transaction_status;
-        let newStatusVerifikasi = payment.status_verifikasi;
-        let shouldConfirmBooking = false;
-        let shouldCancelBooking = false;
-
-        if (transaction_status === "capture") {
-            if (fraud_status === "challenge") {
-                newTransactionStatus = "challenge";
-                newStatusVerifikasi = "menunggu_verifikasi";
-            } else if (fraud_status === "accept") {
-                newTransactionStatus = "settlement";
-                newStatusVerifikasi = "diterima";
-                shouldConfirmBooking = true;
-            }
-        } else if (transaction_status === "settlement") {
-            newTransactionStatus = "settlement";
-            newStatusVerifikasi = "diterima";
-            shouldConfirmBooking = true;
-        } else if (transaction_status === "pending") {
-            newTransactionStatus = "pending";
-            newStatusVerifikasi = "menunggu_verifikasi";
-        } else if (
-            transaction_status === "deny" ||
-            transaction_status === "cancel" ||
-            transaction_status === "expire"
-        ) {
-            newTransactionStatus = transaction_status;
-            newStatusVerifikasi = "ditolak";
-            shouldCancelBooking = true;
-        } else if (transaction_status === "refund") {
-            newTransactionStatus = "refund";
-            newStatusVerifikasi = "ditolak";
-        }
-
-        // Update tabel payments
-        await db.query(
-            `UPDATE payments
-             SET transaction_status = ?,
-                 status_verifikasi = ?,
-                 payment_type = COALESCE(?, payment_type),
-                 transaction_id = COALESCE(?, transaction_id),
-                 transaction_time = COALESCE(?, transaction_time),
-                 settlement_time = COALESCE(?, settlement_time),
-                 updated_at = NOW()
-             WHERE id = ?`,
-            [
-                newTransactionStatus,
-                newStatusVerifikasi,
-                payment_type || null,
-                transaction_id || null,
-                transaction_time || null,
-                settlement_time || (newTransactionStatus === "settlement" ? new Date() : null),
-                payment.id,
-            ]
-        );
-
-        // Update status booking jika status berubah
-        if (shouldConfirmBooking) {
-            await db.query(
-                `UPDATE booking SET status = 'dikonfirmasi', updated_at = NOW() WHERE id = ?`,
-                [payment.booking_id]
-            );
-        } else if (shouldCancelBooking) {
-            await db.query(
-                `UPDATE booking SET status = 'dibatalkan', updated_at = NOW() WHERE id = ? AND status = 'menunggu'`,
-                [payment.booking_id]
-            );
-        }
-
-        return res.status(200).json({
-            success: true,
-            message: "Notifikasi Midtrans berhasil diproses",
-            data: {
-                orderId: order_id,
-                transactionStatus: newTransactionStatus,
-                statusVerifikasi: newStatusVerifikasi,
-            },
-        });
-    } catch (error) {
-        console.error("Payment Notification Error:", error);
-        return res.status(500).json({
-            success: false,
-            message: "Gagal memproses notifikasi pembayaran",
-            error: error.message,
-        });
-    }
+    return res.status(200).json({
+        success: true,
+        message: "Midtrans webhook dinonaktifkan.",
+    });
 };
 
 module.exports = {
     getPaymentByBookingId,
     submitManualPayment,
     verifyManualPayment,
-    createPayment,
     getPaymentStatus,
+    createPayment,
     paymentNotification,
 };

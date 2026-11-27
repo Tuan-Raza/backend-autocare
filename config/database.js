@@ -38,6 +38,20 @@ const testConnection = async () => {
             if (adminNoteCols.length === 0) {
                 await connection.query("ALTER TABLE booking ADD COLUMN catatan_admin TEXT NULL");
             }
+
+            // Migration aman untuk Payments (QRIS & COD)
+            const [verifiedByCols] = await connection.query("SHOW COLUMNS FROM payments LIKE 'verified_by'");
+            if (verifiedByCols.length === 0) {
+                await connection.query("ALTER TABLE payments ADD COLUMN verified_by INT NULL");
+            }
+            const [verifiedAtCols] = await connection.query("SHOW COLUMNS FROM payments LIKE 'verified_at'");
+            if (verifiedAtCols.length === 0) {
+                await connection.query("ALTER TABLE payments ADD COLUMN verified_at DATETIME NULL");
+            }
+            const [catatanPenolakanCols] = await connection.query("SHOW COLUMNS FROM payments LIKE 'catatan_penolakan'");
+            if (catatanPenolakanCols.length === 0) {
+                await connection.query("ALTER TABLE payments ADD COLUMN catatan_penolakan TEXT NULL");
+            }
         } catch (tableErr) {
             console.error("Migration warning:", tableErr.message);
         }
