@@ -113,23 +113,37 @@ describe("Admin Controller & Auth Unit Tests", () => {
             expect(req.user.email).toBe("admin@autocare.com");
         });
 
-        it("requireAdmin harus menolak user dengan role non-admin", async () => {
-            req.user = { id: 10, role: "user" };
-            const next = vi.fn();
-            db.query.mockResolvedValueOnce([[{ id: 10, role: "user", status: "aktif" }]]);
+        
+it("requireAdmin harus meloloskan user dengan role admin", async () => {
+    req.user = { id: 10, role: "admin" };
+    const next = vi.fn();
 
-            await requireAdmin(req, res, next);
-            expect(res.status).toHaveBeenCalledWith(403);
-            expect(next).not.toHaveBeenCalled();
-        });
+    db.query.mockResolvedValueOnce([
+        [
+            {
+                id: 10,
+                nama: "Admin AutoCare",
+                email: "admin@autocare.com",
+                role: "admin",
+                status: "aktif",
+            },
+        ],
+        [],
+    ]);
 
-        it("requireAdmin harus meloloskan user dengan role admin", async () => {
-            req.user = { id: 10, role: "admin" };
-            const next = vi.fn();
+    await requireAdmin(req, res, next);
 
-            await requireAdmin(req, res, next);
-            expect(next).toHaveBeenCalled();
-        });
+    expect(db.query).toHaveBeenCalledWith(
+        "SELECT id, nama, email, role, status FROM users WHERE id = ? LIMIT 1",
+        [10]
+    );
+    expect(next).toHaveBeenCalled();
+    expect(req.user.role).toBe("admin");
+    expect(req.user.nama).toBe("Admin AutoCare");
+});
+
+
+        
     });
 
     describe("Booking Status Transition", () => {

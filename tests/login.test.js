@@ -85,7 +85,7 @@ describe("White Box Testing - Controller Auth: login()", () => {
             await login(req, res);
 
             expect(db.query).toHaveBeenCalledWith(
-                "SELECT * FROM users WHERE email = ?",
+                "SELECT id, nama, email, no_hp, password, foto, role, status FROM users WHERE LOWER(email) = ? LIMIT 1",
                 ["tidakada@autocare.com"]
             );
             expect(res.status).toHaveBeenCalledWith(401);
@@ -164,7 +164,7 @@ describe("White Box Testing - Controller Auth: login()", () => {
             await login(req, res);
 
             expect(db.query).toHaveBeenCalledWith(
-                "SELECT * FROM users WHERE email = ?",
+                "SELECT id, nama, email, no_hp, password, foto, role, status FROM users WHERE LOWER(email) = ? LIMIT 1",
                 ["ahmad@autocare.com"]
             );
             expect(bcrypt.compare).toHaveBeenCalledWith(
@@ -174,17 +174,21 @@ describe("White Box Testing - Controller Auth: login()", () => {
             expect(res.status).not.toHaveBeenCalledWith(400);
             expect(res.status).not.toHaveBeenCalledWith(401);
             expect(res.status).not.toHaveBeenCalledWith(500);
-            expect(res.json).toHaveBeenCalledWith({
-                success: true,
-                message: "Login berhasil",
-                user: {
-                    id: 1,
-                    nama: "Ahmad",
-                    email: "ahmad@autocare.com",
-                    noHp: "081234567890",
-                    foto: "/uploads/profiles/ahmad.jpg",
-                },
-            });
+            expect(res.json).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    success: true,
+                    message: "Login berhasil",
+                    token: expect.any(String),
+                    user: expect.objectContaining({
+                        id: 1,
+                        nama: "Ahmad",
+                        email: "ahmad@autocare.com",
+                        noHp: "081234567890",
+                        foto: "/uploads/profiles/ahmad.jpg",
+                        role: "user",
+                    }),
+                })
+            );
         });
     });
 

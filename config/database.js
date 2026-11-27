@@ -1,3 +1,4 @@
+
 const mysql = require("mysql2/promise");
 
 const db = mysql.createPool({
@@ -11,54 +12,115 @@ const db = mysql.createPool({
     queueLimit: 0,
 });
 
+const ensureColumn = async (connection, table, column, definition) => {
+    const [cols] = await connection.query(
+        "SHOW COLUMNS FROM ?? LIKE ?",
+        [table, column]
+    );
+
+    if (cols.length === 0) {
+        await connection.query(
+            `ALTER TABLE ?? ADD COLUMN ?? ${definition}`,
+            [table, column]
+        );
+    }
+};
+
 const testConnection = async () => {
+    let connection;
+
     try {
-        const connection = await db.getConnection();
+        connection = await db.getConnection();
         console.log("Database connection successful!");
 
-        // Pastikan kolom kode dapat menyimpan hash (VARCHAR 255) dan kolom attempts tersedia
         try {
-            await connection.query("ALTER TABLE email_verifications MODIFY COLUMN kode VARCHAR(255) NOT NULL");
-            await connection.query("ALTER TABLE email_verifications ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0");
-            await connection.query("ALTER TABLE password_resets MODIFY COLUMN kode VARCHAR(255) NOT NULL");
-            await connection.query("ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0");
-            await connection.query("ALTER TABLE email_changes MODIFY COLUMN kode VARCHAR(255) NOT NULL");
-            await connection.query("ALTER TABLE email_changes ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0");
+            // Migration email verification
+            await connection.query(
+                "ALTER TABLE email_verifications MODIFY COLUMN kode VARCHAR(255) NOT NULL"
+            );
+            await ensureColumn(
+                connection,
+                "email_verifications",
+                "attempts",
+                "INT DEFAULT 0"
+            );
 
-            // Migration aman untuk Admin Panel AutoCare
-            const [roleCols] = await connection.query("SHOW COLUMNS FROM users LIKE 'role'");
-            if (roleCols.length === 0) {
-                await connection.query("ALTER TABLE users ADD COLUMN role ENUM('user', 'admin') DEFAULT 'user'");
-            }
-            const [statusCols] = await connection.query("SHOW COLUMNS FROM users LIKE 'status'");
-            if (statusCols.length === 0) {
-                await connection.query("ALTER TABLE users ADD COLUMN status ENUM('aktif', 'nonaktif') DEFAULT 'aktif'");
-            }
-            const [adminNoteCols] = await connection.query("SHOW COLUMNS FROM booking LIKE 'catatan_admin'");
-            if (adminNoteCols.length === 0) {
-                await connection.query("ALTER TABLE booking ADD COLUMN catatan_admin TEXT NULL");
-            }
+            // Migration password reset
+            await connection.query(
+                "ALTER TABLE password_resets MODIFY COLUMN kode VARCHAR(255) NOT NULL"
+            );
+            await ensureColumn(
+                connection,
+                "password_resets",
+                "attempts",
+                "INT DEFAULT 0"
+            );
 
-            // Migration aman untuk Payments (QRIS & COD)
-            const [verifiedByCols] = await connection.query("SHOW COLUMNS FROM payments LIKE 'verified_by'");
-            if (verifiedByCols.length === 0) {
-                await connection.query("ALTER TABLE payments ADD COLUMN verified_by INT NULL");
-            }
-            const [verifiedAtCols] = await connection.query("SHOW COLUMNS FROM payments LIKE 'verified_at'");
-            if (verifiedAtCols.length === 0) {
-                await connection.query("ALTER TABLE payments ADD COLUMN verified_at DATETIME NULL");
-            }
-            const [catatanPenolakanCols] = await connection.query("SHOW COLUMNS FROM payments LIKE 'catatan_penolakan'");
-            if (catatanPenolakanCols.length === 0) {
-                await connection.query("ALTER TABLE payments ADD COLUMN catatan_penolakan TEXT NULL");
-            }
+            // Migration email changes
+            await connection.query(
+                "ALTER TABLE email_changes MODIFY COLUMN kode VARCHAR(255) NOT NULL"
+            );
+            await ensureColumn(
+                connection,
+                "email_changes",
+                "attempts",
+                "INT DEFAULT 0"
+            );
+
+            // Migration Admin Panel
+            await ensureColumn(
+                connection,
+                "users",
+                "role",
+                "ENUM('user', 'admin') DEFAULT 'user'"
+            );
+
+            await ensureColumn(
+                connection,
+                "users",
+                "status",
+                "ENUM('aktif', 'nonaktif') DEFAULT 'aktif'"
+            );
+
+            await ensureColumn(
+                connection,
+                "booking",
+                "catatan_admin",
+                "TEXT NULL"
+            );
+
+            // Migration Payment QRIS & COD
+            await ensureColumn(
+                connection,
+                "payments",
+                "verified_by",
+                "INT NULL"
+            );
+
+            await ensureColumn(
+                connection,
+                "payments",
+                "verified_at",
+                "DATETIME NULL"
+            );
+
+            await ensureColumn(
+                connection,
+                "payments",
+                "catatan_penolakan",
+                "TEXT NULL"
+            );
+
+            console.log("Database migrations checked successfully!");
         } catch (tableErr) {
             console.error("Migration warning:", tableErr.message);
         }
-
-        connection.release();
     } catch (error) {
         console.error("Database connection failed:", error);
+    } finally {
+        if (connection) {
+            connection.release();
+        }
     }
 };
 
